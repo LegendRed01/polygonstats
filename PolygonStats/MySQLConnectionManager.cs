@@ -1,282 +1,255 @@
-﻿using Google.Protobuf.Collections;
-using POGOProtos.Rpc;
-using PolygonStats.Models;
 using System;
+using System.Text.RegularExpressions;
+using Discord.Webhook;
+using Discord;
+using System.Threading;
 using static System.Linq.Queryable;
 using static System.Linq.Enumerable;
-using Serilog;
+using PolygonStats.Configuration;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using POGOProtos.Rpc;
 using Microsoft.EntityFrameworkCore;
 
 namespace PolygonStats
 {
-    class MySQLConnectionManager
-    {
-        public MySQLContext GetContext() {
-            return new MySQLContext();
-        }
+    public class EncounterManager : IDisposable {
 
-        public Session GetSession(MySQLContext context, int id)
+        private static EncounterManager _shared;
+        public static EncounterManager shared
         {
-            return context.Sessions.Where(s => s.Id == id).FirstOrDefault<Session>();
-        }
-
-        public void AddLogEntry(MySQLContext context, int SessionId, LogEntry log) {
-            log.SessionId = SessionId;
-
-            //Update session stats
-            context.Database.ExecuteSqlRaw( $"UPDATE `Session` SET TotalGainedXp=TotalGainedXp+\"{log.XpReward}\", TotalGainedStardust=TotalGainedStardust+{log.StardustReward}, " +
-                                            $"CaughtPokemon=CaughtPokemon+{((log.LogEntryType == LogEntryType.Pokemon && log.CaughtSuccess) ? 1 : 0)}, EscapedPokemon=EscapedPokemon+{((log.LogEntryType == LogEntryType.Pokemon && !log.CaughtSuccess) ? 1 : 0)}, " +
-                                            $"ShinyPokemon=ShinyPokemon+{((log.Shiny) ? 1 : 0)}, Shadow=Shadow+{((log.Shadow) ? 1 : 0)}, Pokestops=Pokestops+{(log.LogEntryType == LogEntryType.Fort ? 1 : 0)}, " +
-                                            $"Rockets=Rockets+{(log.LogEntryType == LogEntryType.Rocket ? 1 : 0)}, Raids=Raids+{(log.LogEntryType == LogEntryType.Raid ? 1 : 0)}, " +
-                                            $"LastUpdate=UTC_TIMESTAMP(), EndTime=UTC_TIMESTAMP(), TotalMinutes=TIMESTAMPDIFF(MINUTE, StartTime, UTC_TIMESTAMP()) WHERE Id={SessionId} ORDER BY Id");
-            context.Logs.Add(log);
-        }
-
-        public void AddEncounterToDatabase(EncounterOutProto encounterProto, MySQLContext context) {
-            if (context.Encounters.Where(e => e.EncounterId == encounterProto.Pokemon.EncounterId).FirstOrDefault() != null ) {
-                return;
-            }
-
-            Encounter encounter = new Encounter();
-            encounter.EncounterId = encounterProto.Pokemon.EncounterId;
-            encounter.PokemonName = encounterProto.Pokemon.Pokemon.PokemonId;
-            encounter.Form = encounterProto.Pokemon.Pokemon.PokemonDisplay.Form;
-            encounter.Stamina = encounterProto.Pokemon.Pokemon.IndividualStamina;
-            encounter.Attack = encounterProto.Pokemon.Pokemon.IndividualAttack;
-            encounter.Defense = encounterProto.Pokemon.Pokemon.IndividualDefense;
-            encounter.Latitude = encounterProto.Pokemon.Latitude;
-            encounter.Longitude = encounterProto.Pokemon.Longitude;
-            encounter.timestamp = DateTime.UtcNow;
-
-            context.Encounters.Add(encounter);
-        }
-
-        public void AddPokemonToDatabase(int dbSessionId, CatchPokemonOutProto catchedPokemon, WildPokemonProto lastEncounter)
-        {
-            using (var context = new MySQLContext()) {
-                LogEntry pokemonLogEntry = new LogEntry { LogEntryType = LogEntryType.Pokemon, CaughtSuccess = catchedPokemon.Status == CatchPokemonOutProto.Types.Status.CatchSuccess, timestamp = DateTime.UtcNow };
-                if (catchedPokemon.Status == CatchPokemonOutProto.Types.Status.CatchSuccess)
-                {
-                    if (catchedPokemon.PokemonDisplay != null)
-                    {
-                        pokemonLogEntry.Shiny = catchedPokemon.PokemonDisplay.Shiny;
-                        pokemonLogEntry.Shadow = catchedPokemon.PokemonDisplay.Alignment == PokemonDisplayProto.Types.Alignment.Shadow;
-                        pokemonLogEntry.Form = catchedPokemon.PokemonDisplay.Form;
-                        pokemonLogEntry.Costume = catchedPokemon.PokemonDisplay.Costume;
-                    }
-                    pokemonLogEntry.PokemonUniqueId = catchedPokemon.CapturedPokemonId;
-                    pokemonLogEntry.CandyAwarded = catchedPokemon.Scores.Candy.Sum();
-                }
-                if (catchedPokemon.Status == CatchPokemonOutProto.Types.Status.CatchFlee && lastEncounter != null)
-                {
-                    if (lastEncounter.Pokemon.PokemonDisplay != null)
-                    {
-                        pokemonLogEntry.Shiny = lastEncounter.Pokemon.PokemonDisplay.Shiny;
-                        pokemonLogEntry.Shadow = lastEncounter.Pokemon.PokemonDisplay.Alignment == PokemonDisplayProto.Types.Alignment.Shadow;
-                        pokemonLogEntry.Form = lastEncounter.Pokemon.PokemonDisplay.Form;
-                        pokemonLogEntry.Costume = lastEncounter.Pokemon.PokemonDisplay.Costume;
-                    }
-                    pokemonLogEntry.PokemonName = lastEncounter.Pokemon.PokemonId;
-                }
-                pokemonLogEntry.XpReward = catchedPokemon.Scores.Exp.Sum();
-                pokemonLogEntry.StardustReward = catchedPokemon.Scores.Stardust.Sum();
-                this.AddLogEntry(context, dbSessionId, pokemonLogEntry);
-                context.SaveChanges();
-            }
-        }
-
-        public void AddFeedBerryToDatabase(int dbSessionId, GymFeedPokemonOutProto gymFeedPokemonProto)
-        {
-            using (var context = new MySQLContext()) {
-                LogEntry feedBerryLogEntry = new LogEntry { LogEntryType = LogEntryType.FeedBerry, timestamp = DateTime.UtcNow };
-
-                feedBerryLogEntry.XpReward = gymFeedPokemonProto.XpAwarded;
-                feedBerryLogEntry.StardustReward = gymFeedPokemonProto.StardustAwarded;
-                feedBerryLogEntry.CandyAwarded = gymFeedPokemonProto.NumCandyAwarded;
-
-                this.AddLogEntry(context, dbSessionId, feedBerryLogEntry);
-                context.SaveChanges();
-            }
-        }
-
-        public void AddQuestToDatabase(int dbSessionId, RepeatedField<QuestRewardProto> rewards)
-        {
-            using (var context = new MySQLContext()) {
-                LogEntry questLogEntry = new LogEntry { LogEntryType = LogEntryType.Quest, timestamp = DateTime.UtcNow, XpReward = 0, StardustReward = 0 };
-                foreach (QuestRewardProto reward in rewards)
-                {
-                    if (reward.RewardCase == QuestRewardProto.RewardOneofCase.Exp)
-                    {
-                        questLogEntry.XpReward += reward.Exp;
-                    }
-                    if (reward.RewardCase == QuestRewardProto.RewardOneofCase.Stardust)
-                    {
-                        questLogEntry.StardustReward += reward.Stardust;
-                    }
-                    if (reward.RewardCase == QuestRewardProto.RewardOneofCase.Candy)
-                    {
-                        questLogEntry.CandyAwarded += reward.Candy.Amount;
-                        questLogEntry.PokemonName = reward.Candy.PokemonId;
-                    }
-                }
-                this.AddLogEntry(context, dbSessionId, questLogEntry);
-                context.SaveChanges();
-            }
-        }
-
-        public void AddHatchedEggToDatabase(int dbSessionId, GetHatchedEggsOutProto getHatchedEggsProto)
-        {
-            using (var context = new MySQLContext()) {
-                for(int index = 0; index < getHatchedEggsProto.HatchedPokemon.Count; index++)
-                {
-                    LogEntry eggLogEntry = new LogEntry { LogEntryType = LogEntryType.Egg, timestamp = DateTime.UtcNow, XpReward = 0, StardustReward = 0 };
-                    eggLogEntry.XpReward = getHatchedEggsProto.ExpAwarded[index];
-                    eggLogEntry.StardustReward = getHatchedEggsProto.StardustAwarded[index];
-                    eggLogEntry.CandyAwarded = getHatchedEggsProto.CandyAwarded[index];
-                    eggLogEntry.PokemonName = getHatchedEggsProto.HatchedPokemon[index].PokemonId;
-                    eggLogEntry.Attack = getHatchedEggsProto.HatchedPokemon[index].IndividualAttack;
-                    eggLogEntry.Defense = getHatchedEggsProto.HatchedPokemon[index].IndividualDefense;
-                    eggLogEntry.Stamina = getHatchedEggsProto.HatchedPokemon[index].IndividualStamina;
-                    eggLogEntry.PokemonUniqueId = getHatchedEggsProto.HatchedPokemon[index].Id;
-                    if (getHatchedEggsProto.HatchedPokemon[index].PokemonDisplay != null)
-                    {
-                        eggLogEntry.Shiny = getHatchedEggsProto.HatchedPokemon[index].PokemonDisplay.Shiny;
-                        eggLogEntry.Shadow = getHatchedEggsProto.HatchedPokemon[index].PokemonDisplay.Alignment == PokemonDisplayProto.Types.Alignment.Shadow;
-                        eggLogEntry.Form = getHatchedEggsProto.HatchedPokemon[index].PokemonDisplay.Form;
-                        eggLogEntry.Costume = getHatchedEggsProto.HatchedPokemon[index].PokemonDisplay.Costume;
-                    }
-                    this.AddLogEntry(context, dbSessionId, eggLogEntry);
-                }
-
-                context.SaveChanges();
-            }
-        }
-
-        public void AddSpinnedFortToDatabase(int dbSessionId, FortSearchOutProto fortSearchProto)
-        {
-            using (var context = new MySQLContext()) {
-                LogEntry fortLogEntry = new LogEntry { LogEntryType = LogEntryType.Fort, timestamp = DateTime.UtcNow };
-
-                fortLogEntry.XpReward = fortSearchProto.XpAwarded;
-
-                this.AddLogEntry(context, dbSessionId, fortLogEntry);
-                context.SaveChanges();
-            }
-        }
-
-        public void AddEvolvePokemonToDatabase(int dbSessionId, EvolvePokemonOutProto evolvePokemon)
-        {
-            using (var context = new MySQLContext()) {
-                LogEntry evolveLogEntry = new LogEntry { LogEntryType = LogEntryType.EvolvePokemon, timestamp = DateTime.UtcNow };
-
-                evolveLogEntry.XpReward = evolvePokemon.ExpAwarded;
-                evolveLogEntry.CandyAwarded = evolvePokemon.CandyAwarded;
-                evolveLogEntry.PokemonName = evolvePokemon.EvolvedPokemon.PokemonId;
-                evolveLogEntry.Attack = evolvePokemon.EvolvedPokemon.IndividualAttack;
-                evolveLogEntry.Defense = evolvePokemon.EvolvedPokemon.IndividualDefense;
-                evolveLogEntry.Stamina = evolvePokemon.EvolvedPokemon.IndividualStamina;
-                evolveLogEntry.PokemonUniqueId = evolvePokemon.EvolvedPokemon.Id;
-                if (evolvePokemon.EvolvedPokemon.PokemonDisplay != null)
-                {
-                    evolveLogEntry.Shadow = evolvePokemon.EvolvedPokemon.PokemonDisplay.Alignment == PokemonDisplayProto.Types.Alignment.Shadow;
-                    evolveLogEntry.Form = evolvePokemon.EvolvedPokemon.PokemonDisplay.Form;
-                    evolveLogEntry.Costume = evolvePokemon.EvolvedPokemon.PokemonDisplay.Costume;
-                }
-
-                this.AddLogEntry(context, dbSessionId, evolveLogEntry);
-                context.SaveChanges();
-            }
-        }
-
-        internal void AddRocketToDatabase(int dbSessionId, UpdateInvasionBattleOutProto updateBattle)
-        {
-            using (var context = new MySQLContext()) {
-                LogEntry rocketLogEntry = new LogEntry { LogEntryType = LogEntryType.Rocket, timestamp = DateTime.UtcNow };
-
-                rocketLogEntry.XpReward = 0;
-                rocketLogEntry.StardustReward = 0;
-                rocketLogEntry.CandyAwarded = 0;
-                foreach (LootItemProto loot in updateBattle.Rewards.LootItem)
-                {
-                    switch(loot.TypeCase)
-                    {
-                        case LootItemProto.TypeOneofCase.Experience:
-                            rocketLogEntry.XpReward += loot.Count;
-                            break;
-                        case LootItemProto.TypeOneofCase.Stardust:
-                            rocketLogEntry.StardustReward += loot.Count;
-                            break;
-                        case LootItemProto.TypeOneofCase.PokemonCandy:
-                            rocketLogEntry.CandyAwarded += loot.Count;
-                            rocketLogEntry.PokemonName = loot.PokemonCandy;
-                            break;
-                    }
-                }
-
-                this.AddLogEntry(context, dbSessionId, rocketLogEntry);
-                context.SaveChanges();
-            }
-        }
-
-        internal void AddRaidToDatabase(int dbSessionId, int xp, int stardust)
-        {
-            using (var context = new MySQLContext()) {
-                LogEntry raidLogEntry = new LogEntry { LogEntryType = LogEntryType.Raid, timestamp = DateTime.UtcNow };
-
-                raidLogEntry.XpReward = xp;
-                raidLogEntry.StardustReward = stardust;
-                this.AddLogEntry(context, dbSessionId, raidLogEntry);
-                context.SaveChanges();
-            }
-        }
-
-        internal void AddPlayerInfoToDatabase(int accountId, GetPlayerOutProto player, int level)
-        {
-            if (player.Player == null) {
-                return;
-            }
-
-            using (var context = new MySQLContext())
+            get
             {
-                var pokecoins = 0;
-                var stardust = 0;
-                var currency = player.Player.CurrencyBalance.FirstOrDefault(c => c.CurrencyType.Equals("POKECOIN"));
-                if (currency != null) {
-                    pokecoins = currency.Quantity;
-                }
-                currency = player.Player.CurrencyBalance.FirstOrDefault(c => c.CurrencyType.Equals("STARDUST"));
-                if (currency != null) {
-                    stardust = currency.Quantity;
-                }
-                try
+                if(_shared == null)
                 {
-                    context.Database.ExecuteSqlRaw($"UPDATE `Account` SET Team=\"{player.Player.Team}\", Level={level}, Pokecoins={pokecoins}, Stardust={stardust} WHERE Id={accountId} ORDER BY Id");
-                } catch (Exception e)
+                    _shared = new EncounterManager();
+                }
+                return _shared;
+            }
+        }
+        private Timer cleanTimer;
+        private Thread consumerThread;
+        private MySQLConnectionManager connectionManager = new MySQLConnectionManager();
+        private BlockingCollection<EncounterOutProto> blockingEncounterQueue = new BlockingCollection<EncounterOutProto>();
+        private Dictionary<ulong, DateTime> alreadySendEncounters = new Dictionary<ulong, DateTime>();
+        private readonly Object lockObj = new Object();
+
+        public EncounterManager() {
+            if (!ConfigurationManager.shared.config.encounterSettings.enabled) {
+                return;
+            }
+            cleanTimer = new Timer(DoCleanTimer, null, TimeSpan.Zero, TimeSpan.FromMinutes(20));
+
+            consumerThread = new Thread(EncounterConsumer);
+            consumerThread.Start();
+        }
+
+        ~EncounterManager() {
+            cleanTimer?.Dispose();
+            consumerThread.Interrupt();
+            consumerThread.Join();
+        }
+        private void DoCleanTimer(object state) {
+            lock (lockObj)
+            {
+                List<ulong> deleteEncounters = alreadySendEncounters.Keys.Where(key =>
                 {
-                    Log.Information(e.Message);
-                    Log.Information(e.InnerException.Message);
+                    return alreadySendEncounters[key].CompareTo(DateTime.Now.Subtract(TimeSpan.FromMinutes(20))) < 0;
+                }).ToList();
+                deleteEncounters.ForEach(id => alreadySendEncounters.Remove(id));
+            }
+
+            // Delete all encounter older than 20 minutes from db
+            if (ConfigurationManager.shared.config.mysqlSettings.enabled 
+                && ConfigurationManager.shared.config.encounterSettings.saveToDatabase) {
+                using(var context = connectionManager.GetContext()) {
+                    context.Database.ExecuteSqlRaw("DELETE FROM `Encounter` WHERE `timestamp` < DATE_SUB( CURRENT_TIME(), INTERVAL 20 MINUTE)");
                 }
             }
         }
 
-        internal void UpdateLevelAndExp(int accountId, PlayerStatsProto playerStats)
-        {
-            if (playerStats == null) {
+        public void AddEncounter(EncounterOutProto encounter) {
+            if (!ConfigurationManager.shared.config.encounterSettings.enabled) {
+                return;
+            }
+            blockingEncounterQueue.Add(encounter);
+        }
+
+        private void EncounterConsumer() {
+            while(true) {
+                List<EncounterOutProto> encounterList = new List<EncounterOutProto>();
+
+                using (var context = new MySQLContext())
+                {
+                    while (blockingEncounterQueue.Count > 0)
+                    {
+                        EncounterOutProto encounter = blockingEncounterQueue.Take();
+                        if (alreadySendEncounters.ContainsKey(encounter.Pokemon.EncounterId))
+                        {
+                            continue;
+                        }
+                        lock (lockObj)
+                        {
+                            alreadySendEncounters.Add(encounter.Pokemon.EncounterId, DateTime.Now);
+                        }
+                        encounterList.Add(encounter);
+
+                        if (!ConfigurationManager.shared.config.mysqlSettings.enabled || !ConfigurationManager.shared.config.encounterSettings.saveToDatabase)
+                        {
+                            continue;
+                        }
+                        connectionManager.AddEncounterToDatabase(encounter, context);
+                    }
+                    context.SaveChanges();
+                }
+                if(encounterList.Count > 0) {
+                    ConfigurationManager.shared.config.encounterSettings.discordWebhooks.ForEach(hook => SendDiscordWebhooks(hook, encounterList));
+                    Thread.Sleep(3000);
+                }
+                Thread.Sleep(1000);
+            }
+        }
+
+        private void SendDiscordWebhooks(Config.EncounterSettings.WebhookSettings webhook, List<EncounterOutProto> encounterList) {
+            List<Discord.Embed> embeds = new List<Discord.Embed>();
+            foreach(EncounterOutProto encounter in encounterList) {
+                PokemonProto pokemon = encounter.Pokemon.Pokemon;
+                if(webhook.filterByIV) {
+                    if(pokemon.IndividualAttack < webhook.minAttackIV) {
+                        continue;
+                    }
+                    if(pokemon.IndividualDefense < webhook.minDefenseIV) {
+                        continue;
+                    }
+                    if(pokemon.IndividualStamina < webhook.minStaminaIV) {
+                        continue;
+                    }
+                }
+                if(webhook.filterByLocation) {
+                    if(DistanceTo(webhook.latitude, webhook.longitude, encounter.Pokemon.Latitude, encounter.Pokemon.Longitude) > webhook.distanceInKm) {
+                        continue;
+                    }
+                }
+                EmbedBuilder eb = new EmbedBuilder(){
+                    Title = $"Level {getPokemonLevel(pokemon.CpMultiplier)} {pokemon.PokemonId.ToString("g")} (#{(int) pokemon.PokemonId})",
+                    Author = new EmbedAuthorBuilder(){
+
+                        Name = $"{Math.Round(encounter.Pokemon.Latitude,5)}, {Math.Round(encounter.Pokemon.Longitude,5)}",
+                    },
+                    ThumbnailUrl = getPokemonImageUrl(pokemon.PokemonId),
+                    Fields = new List<EmbedFieldBuilder>(){
+                        new EmbedFieldBuilder(){
+                            Name = "Stats",
+                            Value = $"CP: {pokemon.Cp}\nIVs:{pokemon.IndividualAttack}/{pokemon.IndividualDefense}/{pokemon.IndividualStamina} | {getIV(pokemon.IndividualAttack,pokemon.IndividualDefense,pokemon.IndividualStamina)}%"
+                        },
+                        new EmbedFieldBuilder(){
+                            Name = "Moves",
+                            Value = $"Fast: {formatMove(pokemon.Move1.ToString())}\nCharge: {formatMove(pokemon.Move2.ToString())}"
+                        },
+                        new EmbedFieldBuilder() {
+                            Name = "Links",
+                            Value = $"[Google Maps](https://maps.google.com/maps?q={Math.Round(encounter.Pokemon.Latitude,5)},{Math.Round(encounter.Pokemon.Longitude,5)}) [Apple Maps](http://maps.apple.com/?daddr={Math.Round(encounter.Pokemon.Latitude,5)},{Math.Round(encounter.Pokemon.Longitude,5)})"
+                        }
+
+                    },
+                    Color = Color.Blue
+                };
+
+                embeds.Add(eb.Build());
+            }
+
+            if(embeds.Count <= 0) {
                 return;
             }
 
-            using (var context = new MySQLContext())
-            {
-                try
-                {
-                    context.Database.ExecuteSqlRaw($"UPDATE `Account` SET Level={playerStats.Level},Experience={(int)playerStats.Experience},NextLevelExp={playerStats.NextLevelExp} WHERE Id={accountId} ORDER BY Id");
-                }
-                catch (Exception e)
-                {
-                    Log.Information(e.Message);
-                    Log.Information(e.InnerException.Message);
+            int errors = 0;
+            bool wasSended = false;
+            
+            while(!wasSended && errors <= 5) {
+                try {
+                    using(DiscordWebhookClient client = new DiscordWebhookClient(webhook.webhookUrl)) {
+                        client.SendMessageAsync(null, false, embeds);
+                        wasSended = true;
+                    }
+                } catch (Exception) {
+                    errors++;
                 }
             }
+        }
+
+        private string getPokemonImageUrl(HoloPokemonId pokemon)
+        {
+            switch (pokemon)
+            {
+                case HoloPokemonId.MrRime:
+                    return $"https://img.pokemondb.net/sprites/go/normal/mr-rime.png";
+                case HoloPokemonId.MrMime:
+                    return $"https://img.pokemondb.net/sprites/bank/normal/mr-mime.png";
+                case HoloPokemonId.MimeJr:
+                    return $"https://img.pokemondb.net/sprites/bank/normal/mime-jr.png";
+                default:
+                    return $"https://img.pokemondb.net/sprites/bank/normal/{pokemon.ToString("g").ToLower().Replace("female", "-f").Replace("male", "-m")}.png";
+            }
+        }
+        
+        private double getPokemonLevel(float cpMultiplier)
+        {
+            double pokemonLevel;
+            if (cpMultiplier < 0.734) {
+                pokemonLevel = 58.35178527 * cpMultiplier * cpMultiplier - 2.838007664 * cpMultiplier + 0.8539209906;
+            } else {
+                pokemonLevel = 171.0112688 * cpMultiplier - 95.20425243;
+            }
+            pokemonLevel = (Math.Round(pokemonLevel) * 2) / 2;
+            return pokemonLevel;
+        }
+
+        private double getIV (int atk, int def, int sta)
+        {
+            double iv = ((atk+def+sta)/45f)*100f;
+            return Math.Round(iv,1);
+        }
+
+        private string splitUppercase(string input) {
+            var regex = new Regex(@"(?<=[A-Z])(?=[A-Z][a-z])|(?<=[^A-Z])(?=[A-Z])");
+            return regex.Replace(input, " ");
+        }
+        private string formatMove(string move)
+        {
+            move =  move.Replace("Fast","");
+            return splitUppercase(move);
+        }
+
+
+        public double DistanceTo(double lat1, double lon1, double lat2, double lon2, char unit = 'K')
+        {
+            double rlat1 = Math.PI*lat1/180;
+            double rlat2 = Math.PI*lat2/180;
+            double theta = lon1 - lon2;
+            double rtheta = Math.PI*theta/180;
+            double dist = Math.Sin(rlat1)*Math.Sin(rlat2) + Math.Cos(rlat1) * Math.Cos(rlat2)*Math.Cos(rtheta);
+            dist = Math.Acos(dist);
+            dist = dist*180/Math.PI;
+            dist = dist*60*1.1515;
+
+            switch (unit)
+            {
+                case 'K': //Kilometers -> default
+                    return dist*1.609344;
+                case 'N': //Nautical Miles 
+                    return dist*0.8684;
+                case 'M': //Miles
+                    return dist;
+            }
+
+            return dist;
+        }
+
+        public void Dispose()
+        {
+            cleanTimer?.Dispose();
+            consumerThread?.Interrupt();
+            consumerThread?.Join();
         }
     }
 }
